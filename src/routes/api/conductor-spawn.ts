@@ -6,8 +6,14 @@ import { json } from '@tanstack/react-start'
 import { isAuthenticated } from '../../server/auth-middleware'
 import { requireJsonContentType } from '../../server/rate-limit'
 import { dashboardFetch, ensureGatewayProbed } from '../../server/gateway-capabilities'
+import { sanitizeConductorMissionGoal } from '../../server/conductor-mission-sanitize'
+import { getSwarmMission } from '../../server/swarm-missions'
+import { dispatchSwarmAssignments } from './swarm-dispatch'
+import type { SwarmMission } from '../../server/swarm-missions'
 
 let cachedSkill: string | null = null
+
+export const NATIVE_CONDUCTOR_MODE_NOTE = 'Native-swarm is the official Workspace-native Swarm fallback when the dashboard Conductor API is unavailable.'
 
 type ConductorSpawnBody = {
   goal?: unknown
@@ -122,6 +128,186 @@ async function createDashboardConductorMission(payload: { name: string; prompt: 
   return { id: data.id, name: data.name, sessionKey: data.session_id }
 }
 
+type NativeConductorAssignment = {
+  workerId: string
+  task: string
+  rationale: string
+  reviewRequired?: boolean
+  direct?: boolean
+  raw?: boolean
+}
+
+function clipText(value: string, max = 8000): string {
+  return value.length <= max ? value : `${value.slice(0, max - 20)}\n...[truncated]`
+}
+
+export function buildNativeConductorAssignments(goal: string, options: { maxParallel: number; supervised: boolean }): Array<NativeConductorAssignment> {
+  const maxParallel = Math.min(5, Math.max(1, options.maxParallel || 1))
+  const normalizedGoal = goal.toLowerCase()
+  const wantsProduction = /production|ready|harden|audit|clean|fix|bug|test|build|release|deploy|operational/.test(normalizedGoal)
+  const wantsDocs = /doc|handoff|readme|spec|plan|summary/.test(normalizedGoal)
+  const assignments: Array<NativeConductorAssignment> = []
+
+  assignments.push({
+    workerId: wantsProduction ? 'swarm2' : 'swarm5',
+    rationale: wantsProduction ? 'Foundation owns runtime contracts and production blockers.' : 'Builder owns the primary implementation lane.',
+    reviewRequired: false,
+    direct: true,
+    task: [
+      `Conductor mission: ${goal}`,
+      '',
+      'Lane: Foundation / primary implementation.',
+      'Find the smallest safe execution plan, make concrete progress, and produce a checkpoint. If code changes are required, keep them scoped and testable.',
+      options.supervised ? 'Supervised mode: stop before destructive writes or commits and report the exact approval needed.' : 'Do not ask for confirmation unless blocked; start immediately.',
+    ].join('\n'),
+  })
+
+  if (maxParallel >= 2) {
+    assignments.push({
+      workerId: 'swarm5',
+      rationale: 'Builder executes implementation or patch work in parallel with foundation analysis.',
+      reviewRequired: false,
+      direct: true,
+      task: [
+        `Conductor mission: ${goal}`,
+        '',
+        'Lane: Builder.',
+        'Implement or prototype the concrete fix/feature path. Avoid broad refactors. Report files changed, tests run, and remaining risks.',
+        options.supervised ? 'Supervised mode: prepare patches but stop before destructive writes or commits if approval is needed.' : 'Proceed without asking unless blocked.',
+      ].join('\n'),
+    })
+  }
+
+  if (maxParallel >= 3) {
+    assignments.push({
+      workerId: 'swarm6',
+      rationale: 'Reviewer independently checks correctness, regressions, and merge risk.',
+      reviewRequired: false,
+      direct: true,
+      task: [
+        `Conductor mission: ${goal}`,
+        '',
+        'Lane: Reviewer / merge gate.',
+        'Review the implementation plan and any changes from Foundation/Builder. Look for regressions, missing tests, unsafe assumptions, and production-readiness gaps. Do not make broad edits unless needed to unblock correctness.',
+      ].join('\n'),
+    })
+  }
+
+  if (maxParallel >= 4) {
+    assignments.push({
+      workerId: 'swarm11',
+      rationale: 'QA validates behavior with targeted tests and smoke checks.',
+      reviewRequired: false,
+      direct: true,
+      task: [
+        `Conductor mission: ${goal}`,
+        '',
+        'Lane: QA.',
+        'Run or design focused verification. Prefer targeted tests/build/smoke checks. Report exact commands and results. If tests are missing, identify the minimal regression coverage needed.',
+      ].join('\n'),
+    })
+  }
+
+  if (maxParallel >= 5 || wantsDocs) {
+    assignments.push({
+      workerId: 'swarm7',
+      rationale: 'Scribe captures handoff, docs, and operational notes.',
+      reviewRequired: false,
+      direct: true,
+      task: [
+        `Conductor mission: ${goal}`,
+        '',
+        'Lane: Scribe.',
+        'Create a concise handoff/status note: what changed, how to operate it, verification, caveats, and next actions. Do not expose secrets.',
+      ].join('\n'),
+    })
+  }
+
+  const selected = assignments.slice(0, maxParallel)
+  if (wantsDocs && !selected.some((assignment) => assignment.workerId === 'swarm7')) {
+    selected[selected.length - 1] = {
+      workerId: 'swarm7',
+      rationale: 'Scribe captures handoff, docs, and operational notes.',
+      reviewRequired: false,
+      direct: true,
+      task: [
+        `Conductor mission: ${goal}`,
+        '',
+        'Lane: Scribe.',
+        'Create a concise handoff/status note: what changed, how to operate it, verification, caveats, and next actions. Do not expose secrets.',
+        options.supervised ? 'Supervised mode: stop before destructive writes or commits and report the exact approval needed.' : 'Proceed without asking unless blocked.',
+      ].join('\n'),
+    }
+  }
+
+  return selected
+}
+
+function swarmMissionStatus(mission: SwarmMission): string {
+  if (mission.state === 'cancelled') return 'cancelled'
+  if (mission.state === 'complete') return 'completed'
+  if (mission.state === 'blocked') return 'failed'
+  return 'running'
+}
+
+function nativeMissionLines(mission: SwarmMission, maxLines: number): Array<string> {
+  const lines = [
+    `Native Workspace Swarm mission: ${mission.title}`,
+    `mission_id: ${mission.id}`,
+    `state: ${mission.state}`,
+    ...mission.assignments.map((assignment) => {
+      const result = assignment.checkpoint?.result ? ` — ${assignment.checkpoint.result}` : ''
+      const blocker = assignment.checkpoint?.blocker ? ` — blocker: ${assignment.checkpoint.blocker}` : ''
+      return `${assignment.workerId} ${assignment.state}: ${assignment.task.slice(0, 160)}${result}${blocker}`
+    }),
+    ...mission.events.slice(-20).map((event) => `${new Date(event.at).toISOString()} ${event.type}: ${event.message}`),
+  ]
+  return lines.slice(-maxLines)
+}
+
+export function toNativeConductorMissionRecord(mission: SwarmMission, maxLines = 400) {
+  return {
+    id: mission.id,
+    name: mission.title,
+    status: swarmMissionStatus(mission),
+    error: mission.state === 'blocked' ? 'Native Workspace Swarm mission blocked' : null,
+    session_id: null,
+    lines: nativeMissionLines(mission, maxLines),
+    exit_code: mission.state === 'blocked' || mission.state === 'cancelled' ? 1 : mission.state === 'complete' ? 0 : null,
+    nativeSwarm: true,
+    modeOfficialOotb: true,
+    modeNote: NATIVE_CONDUCTOR_MODE_NOTE,
+    assignments: mission.assignments,
+    updatedAt: mission.updatedAt,
+  }
+}
+
+function createNativeConductorMission(input: {
+  goal: string
+  missionName: string
+  maxParallel: number
+  supervised: boolean
+}) {
+  const assignments = buildNativeConductorAssignments(input.goal, {
+    maxParallel: input.maxParallel,
+    supervised: input.supervised,
+  })
+  const missionTitle = `Conductor: ${clipText(input.goal, 120)}`
+  void dispatchSwarmAssignments({
+    assignments,
+    missionId: input.missionName,
+    missionTitle,
+    allowAsync: true,
+    waitForCheckpoint: false,
+    timeoutSeconds: 600,
+    checkpointPollSeconds: 10,
+    notifySessionKey: 'main',
+  }).catch((error) => {
+    console.error('[conductor] native swarm dispatch failed:', error instanceof Error ? error.message : String(error))
+  })
+  return { missionId: input.missionName, missionTitle, assignments }
+}
+
 export const Route = createFileRoute('/api/conductor-spawn')({
   server: {
     handlers: {
@@ -133,16 +319,14 @@ export const Route = createFileRoute('/api/conductor-spawn')({
         const lines = Number.isFinite(requestedLines) ? Math.min(2000, Math.max(1, requestedLines)) : 200
         if (!missionId) return json({ ok: false, error: 'missionId required' }, { status: 400 })
 
+        const nativeMission = getSwarmMission(missionId)
+        if (nativeMission) {
+          return json({ ok: true, mode: 'native-swarm', mission: toNativeConductorMissionRecord(nativeMission, lines) })
+        }
+
         const capabilities = await ensureGatewayProbed()
-        if (!capabilities.conductor) {
-          return json(
-            {
-              ok: false,
-              error:
-                'Conductor dashboard mode is unavailable on this Hermes Agent build. Update Hermes Workspace to use portable mode for mission execution, or run a backend that exposes /api/conductor/missions.',
-            },
-            { status: 501 },
-          )
+        if (!capabilities.dashboard.available || !capabilities.conductor) {
+          return json({ ok: false, error: 'Conductor mission not found in native swarm store and dashboard Conductor API is unavailable' }, { status: 404 })
         }
 
         const res = await dashboardFetch(`/api/conductor/missions/${encodeURIComponent(missionId)}?lines=${lines}`)
@@ -166,13 +350,26 @@ export const Route = createFileRoute('/api/conductor-spawn')({
 
         try {
           const body = (await request.json().catch(() => ({}))) as ConductorSpawnBody
-          const goal = readOptionalString(body.goal)
+          const rawGoal = readOptionalString(body.goal)
+          const goalSanitization = sanitizeConductorMissionGoal(rawGoal)
+          const goal = goalSanitization.goal
           const orchestratorModel = readOptionalString(body.orchestratorModel)
           const workerModel = readOptionalString(body.workerModel)
           const projectsDir = readOptionalString(body.projectsDir)
           const maxParallel = readMaxParallel(body.maxParallel)
           const supervised = body.supervised === true
-          if (!goal) return json({ ok: false, error: 'goal required' }, { status: 400 })
+          if (!goal) {
+            return json(
+              {
+                ok: false,
+                error: goalSanitization.removedCloudflareErrorPage
+                  ? 'mission goal only contained a Cloudflare 5xx HTML error page; enter the original mission goal and retry'
+                  : 'goal required',
+                warnings: goalSanitization.warnings,
+              },
+              { status: 400 },
+            )
+          }
 
           const prompt = buildOrchestratorPrompt(goal, loadDispatchSkill(), {
             orchestratorModel,
@@ -184,17 +381,28 @@ export const Route = createFileRoute('/api/conductor-spawn')({
           const missionName = `conductor-${Date.now()}`
           const capabilities = await ensureGatewayProbed()
 
-          if (!capabilities.conductor) {
+          if (!capabilities.dashboard.available || !capabilities.conductor) {
+            const native = createNativeConductorMission({
+              goal,
+              missionName,
+              maxParallel,
+              supervised,
+            })
             return json({
               ok: true,
-              mode: 'portable',
-              prompt,
-              missionId: null,
-              sessionKey: missionName,
+              mode: 'native-swarm',
+              modeOfficialOotb: true,
+              modeNote: NATIVE_CONDUCTOR_MODE_NOTE,
+              prompt: null,
+              missionId: native.missionId,
+              sessionKey: null,
               sessionKeyPrefix: null,
-              jobId: null,
-              jobName: missionName,
+              jobId: native.missionId,
+              jobName: native.missionTitle,
               runId: null,
+              warnings: goalSanitization.warnings,
+              assignments: native.assignments,
+              results: null,
             })
           }
 
@@ -207,10 +415,11 @@ export const Route = createFileRoute('/api/conductor-spawn')({
             prompt: null,
             missionId,
             sessionKey: result.sessionKey ?? null,
-            sessionKeyPrefix: null,
+            sessionKeyPrefix: (result as Record<string, unknown>).sessionKeyPrefix ?? null,
             jobId: missionId,
             jobName: result.name ?? missionName,
             runId: null,
+            warnings: goalSanitization.warnings,
           })
         } catch (error) {
           return json({ ok: false, error: error instanceof Error ? error.message : String(error) }, { status: 500 })
