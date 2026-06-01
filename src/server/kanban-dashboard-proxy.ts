@@ -59,12 +59,12 @@ export type DashboardKanbanBoardResponse = {
  * dashboard session token if we have one — some setups proxy the
  * dashboard behind auth that requires it.
  */
-async function buildHeaders(): Promise<Record<string, string>> {
+async function buildHeaders(force = false): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   }
   try {
-    const token = await fetchDashboardToken()
+    const token = await fetchDashboardToken({ force })
     if (token) headers.Authorization = `Bearer ${token}`
   } catch {
     // Token fetch is best-effort. The plugin route works without it
@@ -87,12 +87,24 @@ async function dashboardFetch<T>(
   init: RequestInit = {},
   params: Record<string, string | undefined> = {},
 ): Promise<T> {
-  const headers = await buildHeaders()
-  const res = await fetch(dashboardUrl(path, params), {
-    ...init,
-    headers: { ...headers, ...(init.headers || {}) },
-    signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
-  })
+  const url = dashboardUrl(path, params)
+  const doFetch = async (force: boolean) => {
+    const headers = await buildHeaders(force)
+    return fetch(url, {
+      ...init,
+      headers: { ...headers, ...(init.headers || {}) },
+      signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
+    })
+  }
+  // The dashboard mints a fresh ephemeral session token on every restart.
+  // A cached token therefore goes stale the moment the dashboard restarts
+  // while the workspace keeps running, and every call 401s until the
+  // workspace itself restarts. On a 401/403, force a token re-scrape and
+  // retry once so we self-heal instead of failing silently.
+  let res = await doFetch(false)
+  if (res.status === 401 || res.status === 403) {
+    res = await doFetch(true)
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => '')
     throw new Error(
